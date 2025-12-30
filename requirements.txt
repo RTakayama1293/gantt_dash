@@ -1,0 +1,24 @@
+# EEZO Gantt Dashboard - Python Dependencies
+
+# Core
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Dash Framework
+dash>=2.14.0
+dash-bootstrap-components>=1.5.0
+plotly>=5.18.0
+
+# Excel Export
+openpyxl>=3.1.0
+xlsxwriter>=3.1.0
+
+# Date handling
+python-dateutil>=2.8.0
+
+# Optional: For better Japanese font support in exports
+# Pillow>=10.0.0
+
+# Development (optional)
+# black>=23.0.0
+# flake8>=6.0.0
