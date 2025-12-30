@@ -16,10 +16,13 @@ from dash import Dash, html, dcc, callback, Output, Input, State, no_update, ctx
 import dash_bootstrap_components as dbc
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from io import BytesIO
 import os
 from typing import Optional
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 # =============================================================================
 # 定数定義
@@ -37,11 +40,23 @@ CATEGORY_COLORS: dict[str, str] = {
     "データ活用": "#2ecc71",            # 緑
 }
 
+# カテゴリのデフォルト順序
+DEFAULT_CATEGORY_ORDER: list[str] = [
+    "プラットフォーム実装",
+    "UX動線",
+    "商品コンテンツ",
+    "集客販促",
+    "データ活用",
+]
+
 # 担当者色設定
 ASSIGNEE_COLORS: dict[str, str] = {
     "松永": "#2980b9",  # 青系
     "高山": "#c0392b",  # 赤系
 }
+
+# 担当者のデフォルト順序
+DEFAULT_ASSIGNEE_ORDER: list[str] = ["松永", "高山"]
 
 
 # =============================================================================
@@ -72,6 +87,58 @@ def load_data(filepath: str) -> pd.DataFrame:
     df["期間"] = (df["終了日"] - df["開始日"]).dt.days + 1
 
     return df
+
+
+def sort_dataframe(
+    df: pd.DataFrame,
+    sort_by: str,
+    sort_order: str,
+    category_order: list[str],
+    assignee_order: list[str]
+) -> pd.DataFrame:
+    """
+    データフレームをソートする。
+
+    Args:
+        df: ソート対象のデータフレーム
+        sort_by: ソートキー（"開始日", "担当者", "カテゴリ"）
+        sort_order: ソート順（"asc", "desc"）
+        category_order: カテゴリの並び順
+        assignee_order: 担当者の並び順
+
+    Returns:
+        pd.DataFrame: ソート済みデータフレーム
+    """
+    ascending = sort_order == "asc"
+    result_df = df.copy()
+
+    if sort_by == "開始日":
+        result_df = result_df.sort_values(
+            ["開始日", "担当者"],
+            ascending=[ascending, True]
+        )
+    elif sort_by == "担当者":
+        # カスタム順序でソート
+        result_df["担当者_order"] = result_df["担当者"].apply(
+            lambda x: assignee_order.index(x) if x in assignee_order else 999
+        )
+        result_df = result_df.sort_values(
+            ["担当者_order", "開始日"],
+            ascending=[ascending, True]
+        )
+        result_df = result_df.drop(columns=["担当者_order"])
+    elif sort_by == "カテゴリ":
+        # カスタム順序でソート
+        result_df["カテゴリ_order"] = result_df["カテゴリ"].apply(
+            lambda x: category_order.index(x) if x in category_order else 999
+        )
+        result_df = result_df.sort_values(
+            ["カテゴリ_order", "開始日"],
+            ascending=[ascending, True]
+        )
+        result_df = result_df.drop(columns=["カテゴリ_order"])
+
+    return result_df
 
 
 # =============================================================================
@@ -114,10 +181,8 @@ def create_gantt_chart(
     df_chart = df.copy()
     if group_by == "担当者":
         df_chart["y_label"] = df_chart["担当者"] + " | " + df_chart["タスク"]
-        df_chart = df_chart.sort_values(["担当者", "開始日"])
     elif group_by == "カテゴリ":
         df_chart["y_label"] = df_chart["カテゴリ"] + " | " + df_chart["タスク"]
-        df_chart = df_chart.sort_values(["カテゴリ", "開始日"])
     else:
         df_chart["y_label"] = df_chart["タスク"]
 
@@ -165,10 +230,10 @@ def create_gantt_chart(
     # 今日線を追加
     if show_today_line:
         today = datetime.now()
-        min_date = df_chart["開始日"].min()
-        max_date = df_chart["終了日"].max()
+        chart_min_date = df_chart["開始日"].min()
+        chart_max_date = df_chart["終了日"].max()
 
-        if min_date <= today <= max_date:
+        if chart_min_date <= today <= chart_max_date:
             fig.add_vline(
                 x=today,
                 line_dash="dash",
@@ -218,59 +283,240 @@ def create_gantt_chart(
     return fig
 
 
-def create_excel_export(df: pd.DataFrame) -> BytesIO:
+# =============================================================================
+# Excelガントチャート出力
+# =============================================================================
+
+def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    """16進数カラーコードをRGBタプルに変換"""
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+
+def create_excel_gantt_chart(
+    df: pd.DataFrame,
+    granularity: str,
+    color_by: str
+) -> BytesIO:
     """
-    フィルター適用後のデータをExcelファイルとしてエクスポートする。
-    タスク一覧とサマリー統計の2シート構成。
+    Excelガントチャートを生成する。
 
     Args:
-        df: エクスポートするデータフレーム
+        df: タスクデータフレーム（ソート済み）
+        granularity: 時間粒度（"day", "week", "month"）
+        color_by: 色分けの基準（"カテゴリ" or "担当者"）
 
     Returns:
         BytesIO: Excelファイルのバイトストリーム
     """
+    if df.empty:
+        output = BytesIO()
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "ガントチャート"
+        ws["A1"] = "データがありません"
+        wb.save(output)
+        output.seek(0)
+        return output
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "ガントチャート"
+
+    # 色マップの選択
+    color_map = CATEGORY_COLORS if color_by == "カテゴリ" else ASSIGNEE_COLORS
+
+    # 日付範囲の計算
+    start_date = df["開始日"].min()
+    end_date = df["終了日"].max()
+
+    # 粒度に応じて日付リストを生成
+    if granularity == "day":
+        date_list = pd.date_range(start=start_date, end=end_date, freq="D")
+        date_format = "%m/%d"
+        header_format = "%m/%d\n(%a)"
+    elif granularity == "week":
+        # 週の開始日（月曜日）に揃える
+        week_start = start_date - timedelta(days=start_date.weekday())
+        date_list = pd.date_range(start=week_start, end=end_date, freq="W-MON")
+        date_format = "%m/%d"
+        header_format = "%m/%d"
+    else:  # month
+        # 月初に揃える
+        month_start = start_date.replace(day=1)
+        date_list = pd.date_range(start=month_start, end=end_date, freq="MS")
+        date_format = "%Y/%m"
+        header_format = "%Y/%m"
+
+    # スタイル定義
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=9)
+    task_font = Font(size=9)
+    center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left_align = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    thin_border = Border(
+        left=Side(style="thin", color="CCCCCC"),
+        right=Side(style="thin", color="CCCCCC"),
+        top=Side(style="thin", color="CCCCCC"),
+        bottom=Side(style="thin", color="CCCCCC")
+    )
+
+    # ヘッダー行1: 年/月（月粒度の場合は四半期）
+    # ヘッダー行2: 日付
+    header_row = 2
+    task_start_row = 3
+
+    # 列の設定
+    # A列: No.
+    # B列: 担当者
+    # C列: カテゴリ
+    # D列: タスク名
+    # E列以降: 日付
+
+    # ヘッダー設定
+    ws.cell(row=1, column=1, value="No.").font = header_font
+    ws.cell(row=1, column=1).fill = header_fill
+    ws.cell(row=1, column=1).alignment = center_align
+    ws.cell(row=1, column=1).border = thin_border
+    ws.column_dimensions["A"].width = 5
+
+    ws.cell(row=1, column=2, value="担当者").font = header_font
+    ws.cell(row=1, column=2).fill = header_fill
+    ws.cell(row=1, column=2).alignment = center_align
+    ws.cell(row=1, column=2).border = thin_border
+    ws.column_dimensions["B"].width = 8
+
+    ws.cell(row=1, column=3, value="カテゴリ").font = header_font
+    ws.cell(row=1, column=3).fill = header_fill
+    ws.cell(row=1, column=3).alignment = center_align
+    ws.cell(row=1, column=3).border = thin_border
+    ws.column_dimensions["C"].width = 18
+
+    ws.cell(row=1, column=4, value="タスク").font = header_font
+    ws.cell(row=1, column=4).fill = header_fill
+    ws.cell(row=1, column=4).alignment = center_align
+    ws.cell(row=1, column=4).border = thin_border
+    ws.column_dimensions["D"].width = 45
+
+    # 日付ヘッダー
+    date_start_col = 5
+    for i, d in enumerate(date_list):
+        col = date_start_col + i
+        cell = ws.cell(row=1, column=col, value=d.strftime(header_format))
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center_align
+        cell.border = thin_border
+
+        # 列幅設定
+        if granularity == "day":
+            ws.column_dimensions[get_column_letter(col)].width = 5
+        elif granularity == "week":
+            ws.column_dimensions[get_column_letter(col)].width = 6
+        else:
+            ws.column_dimensions[get_column_letter(col)].width = 8
+
+    # タスク行の出力
+    for row_idx, (_, task) in enumerate(df.iterrows(), start=2):
+        # No.
+        ws.cell(row=row_idx, column=1, value=row_idx - 1).font = task_font
+        ws.cell(row=row_idx, column=1).alignment = center_align
+        ws.cell(row=row_idx, column=1).border = thin_border
+
+        # 担当者
+        ws.cell(row=row_idx, column=2, value=task["担当者"]).font = task_font
+        ws.cell(row=row_idx, column=2).alignment = center_align
+        ws.cell(row=row_idx, column=2).border = thin_border
+
+        # カテゴリ
+        ws.cell(row=row_idx, column=3, value=task["カテゴリ"]).font = task_font
+        ws.cell(row=row_idx, column=3).alignment = left_align
+        ws.cell(row=row_idx, column=3).border = thin_border
+
+        # タスク名（マイルストーンは★を付ける）
+        task_name = task["タスク"]
+        if task["is_milestone"]:
+            task_name = "★ " + task_name
+        ws.cell(row=row_idx, column=4, value=task_name).font = task_font
+        ws.cell(row=row_idx, column=4).alignment = left_align
+        ws.cell(row=row_idx, column=4).border = thin_border
+
+        # 色の取得
+        color_key = task[color_by]
+        hex_color = color_map.get(color_key, "#999999")
+        rgb = hex_to_rgb(hex_color)
+        fill_color = PatternFill(
+            start_color=f"{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}",
+            end_color=f"{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}",
+            fill_type="solid"
+        )
+
+        # 日付セルの塗りつぶし
+        task_start = task["開始日"]
+        task_end = task["終了日"]
+
+        for i, d in enumerate(date_list):
+            col = date_start_col + i
+            cell = ws.cell(row=row_idx, column=col)
+            cell.border = thin_border
+
+            # 粒度に応じた期間判定
+            if granularity == "day":
+                period_start = d
+                period_end = d
+            elif granularity == "week":
+                period_start = d
+                period_end = d + timedelta(days=6)
+            else:  # month
+                period_start = d
+                # 月末を計算
+                if d.month == 12:
+                    period_end = d.replace(year=d.year + 1, month=1, day=1) - timedelta(days=1)
+                else:
+                    period_end = d.replace(month=d.month + 1, day=1) - timedelta(days=1)
+
+            # タスク期間と重なるかチェック
+            if task_start <= period_end and task_end >= period_start:
+                cell.fill = fill_color
+
+    # 行の高さ設定
+    for row in range(1, len(df) + 2):
+        ws.row_dimensions[row].height = 20
+
+    # ウィンドウ枠の固定（ヘッダーとタスク名列）
+    ws.freeze_panes = "E2"
+
+    # 凡例シートの追加
+    ws_legend = wb.create_sheet(title="凡例")
+
+    ws_legend.cell(row=1, column=1, value="【色の凡例】").font = Font(bold=True, size=11)
+
+    legend_items = CATEGORY_COLORS if color_by == "カテゴリ" else ASSIGNEE_COLORS
+    for i, (name, hex_color) in enumerate(legend_items.items(), start=3):
+        rgb = hex_to_rgb(hex_color)
+        fill = PatternFill(
+            start_color=f"{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}",
+            end_color=f"{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}",
+            fill_type="solid"
+        )
+        ws_legend.cell(row=i, column=1).fill = fill
+        ws_legend.cell(row=i, column=1).border = thin_border
+        ws_legend.cell(row=i, column=2, value=name).font = Font(size=10)
+        ws_legend.column_dimensions["A"].width = 5
+        ws_legend.column_dimensions["B"].width = 20
+
+    # サマリー情報
+    summary_row = len(legend_items) + 5
+    ws_legend.cell(row=summary_row, column=1, value="【サマリー】").font = Font(bold=True, size=11)
+    ws_legend.cell(row=summary_row + 1, column=1, value="総タスク数:")
+    ws_legend.cell(row=summary_row + 1, column=2, value=len(df))
+    ws_legend.cell(row=summary_row + 2, column=1, value="期間:")
+    ws_legend.cell(row=summary_row + 2, column=2, value=f"{start_date.strftime('%Y/%m/%d')} 〜 {end_date.strftime('%Y/%m/%d')}")
+    ws_legend.cell(row=summary_row + 3, column=1, value="マイルストーン数:")
+    ws_legend.cell(row=summary_row + 3, column=2, value=df["is_milestone"].sum())
+
     output = BytesIO()
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        # シート1: タスク一覧
-        export_df = df[[
-            "四半期", "週番号", "開始日", "終了日",
-            "担当者", "カテゴリ", "タスク", "成果物/マイルストーン", "期間"
-        ]].copy()
-        export_df["開始日"] = export_df["開始日"].dt.strftime("%Y/%m/%d")
-        export_df["終了日"] = export_df["終了日"].dt.strftime("%Y/%m/%d")
-        export_df.to_excel(writer, sheet_name="タスク一覧", index=False)
-
-        # シート2: サマリー統計
-        summary_data = []
-
-        # 全体統計
-        summary_data.append({"項目": "総タスク数", "値": len(df)})
-        summary_data.append({"項目": "期間開始", "値": df["開始日"].min().strftime("%Y/%m/%d")})
-        summary_data.append({"項目": "期間終了", "値": df["終了日"].max().strftime("%Y/%m/%d")})
-        summary_data.append({"項目": "マイルストーン数", "値": df["is_milestone"].sum()})
-        summary_data.append({"項目": "", "値": ""})
-
-        # 担当者別
-        summary_data.append({"項目": "【担当者別タスク数】", "値": ""})
-        for assignee, count in df.groupby("担当者").size().items():
-            summary_data.append({"項目": f"  {assignee}", "値": count})
-        summary_data.append({"項目": "", "値": ""})
-
-        # カテゴリ別
-        summary_data.append({"項目": "【カテゴリ別タスク数】", "値": ""})
-        for category, count in df.groupby("カテゴリ").size().items():
-            summary_data.append({"項目": f"  {category}", "値": count})
-        summary_data.append({"項目": "", "値": ""})
-
-        # 四半期別
-        summary_data.append({"項目": "【四半期別タスク数】", "値": ""})
-        for quarter, count in df.groupby("四半期").size().items():
-            summary_data.append({"項目": f"  {quarter}", "値": count})
-
-        summary_df = pd.DataFrame(summary_data)
-        summary_df.to_excel(writer, sheet_name="サマリー統計", index=False)
-
+    wb.save(output)
     output.seek(0)
     return output
 
@@ -401,20 +647,6 @@ filter_card = dbc.Card([
                 )
             ], md=3),
             dbc.Col([
-                dbc.Label("ソート順", className="fw-bold text-muted small"),
-                dbc.RadioItems(
-                    id="sort-by",
-                    options=[
-                        {"label": "開始日", "value": "開始日"},
-                        {"label": "担当者", "value": "担当者"},
-                        {"label": "カテゴリ", "value": "カテゴリ"}
-                    ],
-                    value="開始日",
-                    inline=True,
-                    className="mt-1"
-                )
-            ], md=3),
-            dbc.Col([
                 dbc.Label("色分け", className="fw-bold text-muted small"),
                 dbc.RadioItems(
                     id="color-by",
@@ -439,7 +671,58 @@ filter_card = dbc.Card([
             ], md=2),
         ], className="mb-3"),
 
-        # 第3行: 日付範囲スライダー
+        # 第3行: ソート設定（強化）
+        dbc.Row([
+            dbc.Col([
+                dbc.Label("ソート項目", className="fw-bold text-muted small"),
+                dcc.Dropdown(
+                    id="sort-by",
+                    options=[
+                        {"label": "開始日", "value": "開始日"},
+                        {"label": "担当者", "value": "担当者"},
+                        {"label": "カテゴリ", "value": "カテゴリ"}
+                    ],
+                    value="開始日",
+                    clearable=False,
+                    className="mt-1"
+                )
+            ], md=2),
+            dbc.Col([
+                dbc.Label("昇順/降順", className="fw-bold text-muted small"),
+                dbc.RadioItems(
+                    id="sort-order",
+                    options=[
+                        {"label": "昇順 ↑", "value": "asc"},
+                        {"label": "降順 ↓", "value": "desc"}
+                    ],
+                    value="asc",
+                    inline=True,
+                    className="mt-1"
+                )
+            ], md=2),
+            dbc.Col([
+                dbc.Label("カテゴリ並び順", className="fw-bold text-muted small"),
+                dcc.Dropdown(
+                    id="category-order",
+                    options=[{"label": c, "value": c} for c in DEFAULT_CATEGORY_ORDER],
+                    value=DEFAULT_CATEGORY_ORDER,
+                    multi=True,
+                    placeholder="ドラッグで並べ替え..."
+                )
+            ], md=4),
+            dbc.Col([
+                dbc.Label("担当者並び順", className="fw-bold text-muted small"),
+                dcc.Dropdown(
+                    id="assignee-order",
+                    options=[{"label": a, "value": a} for a in DEFAULT_ASSIGNEE_ORDER],
+                    value=DEFAULT_ASSIGNEE_ORDER,
+                    multi=True,
+                    placeholder="ドラッグで並べ替え..."
+                )
+            ], md=2),
+        ], className="mb-3"),
+
+        # 第4行: 日付範囲スライダー
         dbc.Row([
             dbc.Col([
                 dbc.Label("日付範囲", className="fw-bold text-muted small"),
@@ -499,12 +782,8 @@ summary_card = dbc.Card([
     ])
 ], className="mb-3 shadow-sm")
 
-# タスク並び替え用ストア（セッション内保持）
-task_order_store = dcc.Store(id="task-order-store", storage_type="session")
-
 # メインレイアウト
 app.layout = dbc.Container([
-    task_order_store,
     header,
     filter_card,
     summary_card,
@@ -551,6 +830,9 @@ app.layout = dbc.Container([
      Input("granularity", "value"),
      Input("group-by", "value"),
      Input("sort-by", "value"),
+     Input("sort-order", "value"),
+     Input("category-order", "value"),
+     Input("assignee-order", "value"),
      Input("date-range-slider", "value"),
      Input("show-today-line", "value")]
 )
@@ -562,6 +844,9 @@ def update_dashboard(
     granularity: str,
     group_by: str,
     sort_by: str,
+    sort_order: str,
+    category_order: list[str],
+    assignee_order: list[str],
     date_range: list[int],
     show_today_line: list
 ) -> tuple:
@@ -581,12 +866,13 @@ def update_dashboard(
     ].copy()
 
     # ソート
-    if sort_by == "開始日":
-        filtered_df = filtered_df.sort_values(["開始日", "担当者"])
-    elif sort_by == "担当者":
-        filtered_df = filtered_df.sort_values(["担当者", "開始日"])
-    else:  # カテゴリ
-        filtered_df = filtered_df.sort_values(["カテゴリ", "開始日"])
+    filtered_df = sort_dataframe(
+        filtered_df,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        category_order=category_order or DEFAULT_CATEGORY_ORDER,
+        assignee_order=assignee_order or DEFAULT_ASSIGNEE_ORDER
+    )
 
     # ガントチャート生成
     show_today = True in (show_today_line or [])
@@ -645,7 +931,13 @@ def update_dashboard(
     [State("quarter-filter", "value"),
      State("assignee-filter", "value"),
      State("category-filter", "value"),
-     State("date-range-slider", "value")],
+     State("date-range-slider", "value"),
+     State("sort-by", "value"),
+     State("sort-order", "value"),
+     State("category-order", "value"),
+     State("assignee-order", "value"),
+     State("granularity", "value"),
+     State("color-by", "value")],
     prevent_initial_call=True
 )
 def download_excel(
@@ -653,9 +945,15 @@ def download_excel(
     quarters: list[str],
     assignees: list[str],
     categories: list[str],
-    date_range: list[int]
+    date_range: list[int],
+    sort_by: str,
+    sort_order: str,
+    category_order: list[str],
+    assignee_order: list[str],
+    granularity: str,
+    color_by: str
 ) -> dict:
-    """フィルター適用後のデータをExcelでダウンロード"""
+    """フィルター適用後のデータをExcelガントチャートでダウンロード"""
 
     # 日付範囲の計算
     start_date = min_date + pd.Timedelta(days=date_range[0])
@@ -667,10 +965,25 @@ def download_excel(
         (df["カテゴリ"].isin(categories or [])) &
         (df["開始日"] >= start_date) &
         (df["終了日"] <= end_date)
-    ]
+    ].copy()
 
-    excel_data = create_excel_export(filtered_df)
-    filename = f"eezo_tasks_{datetime.now().strftime('%Y%m%d')}.xlsx"
+    # ソート（画面と同じ順序）
+    filtered_df = sort_dataframe(
+        filtered_df,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        category_order=category_order or DEFAULT_CATEGORY_ORDER,
+        assignee_order=assignee_order or DEFAULT_ASSIGNEE_ORDER
+    )
+
+    # Excelガントチャート生成
+    excel_data = create_excel_gantt_chart(
+        filtered_df,
+        granularity=granularity,
+        color_by=color_by
+    )
+
+    filename = f"eezo_gantt_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
     return dcc.send_bytes(excel_data.getvalue(), filename)
 
